@@ -1,0 +1,5 @@
+{
+  "id": "2026-10-15-351",
+  "enabled": true,
+  "message": "Update 3.5.1: Fixed Android crash and issue with catalog images. More controller support with SDL3. Smarter automatic download picking, and Quiver can now install .tar.xz files."
+}

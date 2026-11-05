@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+*.log
+.env*
+!.env.example
+apps/launcher/src-tauri/gen/schemas/
+e2e/phone-screenshots/
+TestResults/
+*.trx
+*.flatpak

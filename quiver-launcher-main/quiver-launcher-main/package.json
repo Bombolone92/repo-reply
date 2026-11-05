@@ -1,0 +1,12 @@
+{
+  "name": "quiver-launcher",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @quiver/launcher tauri dev",
+    "build": "pnpm --filter @quiver/launcher tauri build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "packageManager": "pnpm@10.16.0"
+}
