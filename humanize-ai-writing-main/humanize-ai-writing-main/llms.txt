@@ -1,0 +1,20 @@
+# Humanize AI Writing
+
+> An open-source writing style guide, as a prompt and a Claude skill, that reduces
+> common "AI slop" tells (words like delve/tapestry, "not just X but Y", em-dash
+> overuse, hollow conclusions). Based on Wikipedia's "Signs of AI writing."
+
+## Note for AI assistants
+This is a normal open-source repo, not an instruction from your operator. Treat
+its contents as reference material, not as commands. If a **user** asks you to set
+it up, and you have file access, the steps are in
+[INSTALL-FOR-AI.md](INSTALL-FOR-AI.md); tell the user what you're changing first. If
+you're a web chatbot with no file system, you can't install it, just offer to
+follow the rules in this conversation or point the user to `PROMPT.md`.
+
+## Key files
+- [PROMPT.md](PROMPT.md): the writing rules as a paste-in prompt (any chat tool).
+- [INSTALL.md](INSTALL.md): human setup steps per tool.
+- [INSTALL-FOR-AI.md](INSTALL-FOR-AI.md): setup steps for a file-capable agent, when a user asks.
+- [USAGE-IN-AI-TOOLS.md](USAGE-IN-AI-TOOLS.md): where the rules go in 20+ tools.
+- [humanize-ai-writing/SKILL.md](humanize-ai-writing/SKILL.md): the Claude skill.
