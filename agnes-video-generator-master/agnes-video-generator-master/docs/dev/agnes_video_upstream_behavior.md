@@ -1,0 +1,310 @@
+# Agnes 视频上游接口实测行为（Upstream Video API Behavior）
+
+> **文档定位**：记录 `apihub.agnes-ai.com` 视频接口**实测**的行为、错误语义与产物规格，供流水线重试策略、错误透出、回归判定与对外文档撰写时引用。本文只写「观测到的事实」，改进项见 `../plans/v7.0/upstream_error_handling_plan.md`。
+> **最近实测**：2026-10-14 晚（UTC+8，Issue #95 排查，提交侧探针，见 §4.0.2）。上一轮全链路实测 2026-09-28 上午（UTC+8），用本机 `AGNES_API_KEY` 直连上游，请求体逐字段复刻官网 `/en/demo` 前端（`video-website/components/demo/TextToVideo.tsx`）。样本量小（每档 1–2 次），标注为「单例」的结论不得当作稳定规律。
+> **关联**：Issue #75（demo 报 "Video generation timed out"）、`docs/public/faq.md`、`docs/dev/regression_test_plan.md` F3、`docs/dev/pipeline_products.md`。
+
+---
+
+## 1. 接口清单
+
+| 用途 | 端点 | 实测结论 |
+|------|------|----------|
+| 提交生成 | `POST /v1/videos` | 正常。返回体同时含 `id` / `video_id` / `task_id` 三个字段（语义见 §2） |
+| 轮询状态 | `GET /agnesapi?video_id=<id>` | **唯一能拿到终态与失败原因的端点**。2.5 系列需追加 `&model_name=<model>` |
+| 查询单任务 | `GET /v1/videos/<id>` | 对本项目产生的任务一律 `400 {"code":"task_not_exist"}`，不可用 |
+| 任务列表 | `GET /v1/videos` | `404 {"message":"Invalid URL (GET /v1/videos)"}`，不存在 |
+| 模型清单 | `GET /v1/models` | 正常，含 `agnes-video-2.5-flash` 等 |
+| 文生图 | `POST /v1/images/generations` | 正常，同步返回（实测 11.6s 出 `data[0].url`） |
+
+**双域名同库**：同一个 `video_id` 在 `apihub.agnes-ai.com` 与 `apihub.agnes-ai.cn` 上查到的记录完全一致（`created_at`/`completed_at`/`error` 全同），说明两域名共享任务存储。多 Key 域名回退（`core/config.py` 的域名映射）不会因为切换域名而丢失已在途的任务。
+
+**网关身份**：响应头带 `x-new-api-version` / `x-oneapi-request-id` / `x-trace-id`，即 apihub 是 new-api 网关。**网关自造的错文案都带 `(request id: ...)` 后缀**（如 `task not found (request id: ...)`、`video queue is full, please retry later (request id: ...)`）；不带该后缀的（如 §3 的 15 分钟错）是从推理后端透传出来的任务记录内容。
+
+---
+
+## 2. 任务 id 的三个字段（易踩坑）
+
+提交响应里三个字段的值**不总是相同**，且**只有 `video_id` 一定能轮询**：
+
+| 模型 | `id` | `video_id` | `task_id` | 用哪个轮询 |
+|------|------|-----------|-----------|-----------|
+| `agnes-video-v2.0` | `task_jnDq1BTH…` | `video_bGl0ZWxsbT…`（base64，内嵌 `video_1e081f87…`） | 同 `id` | **`video_id`**。用 `id` 轮询 → `404 task not found` |
+| `agnes-video-2.5-flash` | `task_putf0OHP…` | 同 `id` | 同 `id` | 三者等价 |
+
+`video_id` 解码后形如 `litellm:custom_llm_provider:openai;model_id:agnes-video-v2.0;video_id:video_xxx`，是网关的路由键，**长度可变、不要假设格式**。
+
+> 现状核对：`core/api/agnes_video.py:437` 与官网 demo `TextToVideo.tsx:274` 都按 `video_id || task_id || id` 取值，顺序正确。任何新代码（含脚本、回归工具）都必须沿用这个优先级，不要图省事用 `id`。
+
+---
+
+## 3. 终态与错误语义
+
+### 3.1 失败是 HTTP 200
+
+轮询端点在任务失败时**仍返回 HTTP 200**，失败信息在响应体里：
+
+```json
+{
+  "status": "failed",
+  "internal_status": "stuck_inference",
+  "error": {"code": "500", "message": "ComfyUI internal error: inference not finished after 15 minutes"},
+  "url": null,
+  "created_at": 1790562564,
+  "started_at": null,
+  "completed_at": 1790563517,
+  "progress": 0,
+  "internal_progress": 100
+}
+```
+
+只判断 HTTP 状态码的客户端会把它当成成功。**判据只能是 body 的 `status` + `error`。**
+
+### 3.2 上游有约 15 分钟的推理硬闸
+
+上例从 `created_at` 到 `completed_at` 为 **953 秒**，`error.message` 明写 "not finished after 15 minutes"，`url` 为 `null`。即：**这类任务再等也不会有产物**，不是"等得不够久"。（单例观测；阈值起点未独立验证——该记录 `started_at` 为 `null`，无法确认 15 分钟是从创建还是从推理开始计时。）
+
+### 3.3 字段可靠性
+
+| 字段 | 可用性 | 说明 |
+|------|--------|------|
+| `status` | ✅ 可作判据 | 观测到 `pending` / `in_progress` / `completed` / `failed` |
+| `error` | ✅ 但**是对象** `{code, message}` | 直接当字符串用会污染文案或崩渲染 |
+| `url` | ✅ 终态产物地址 | 失败时为 `null`；域名会在 `platform-outputs.agnes-ai.space` 与 `cos-platform-outputs.agnes-ai.cn` 之间变化 |
+| `progress` / `internal_progress` | ❌ 不可作判据 | 失败样本里 `progress=0` 而 `internal_progress=100`，互相矛盾 |
+| `started_at` | ⚠️ 可能为 `null` | 不能用来推算排队/推理耗时 |
+| `perf_params` | ⚠️ 是**推理内部尺寸**，非产物尺寸 | 见 §5 |
+| `expires_at` | 观测均为 `null` | 产物链接有效期未知，仍应尽快下载落盘 |
+
+### 3.4 状态迁移（实测样本）
+
+- 2.5-flash：`pending`(progress 0) → `in_progress`(10 → 70) → `completed`(100)。接受后 **158s**（5s/9:16）与 **86s**（4s/16:9）完成。
+- v2.0：`in_progress`(30) → `completed`(100)。接受后 **92s**（5s）/ **88s**（5s 竖屏）完成。
+- 排队→开始渲染的间隔：`created_at → started_at` 实测 36s（2.5-flash 一例）。
+
+---
+
+## 4. 提交侧瞬时错误
+
+| HTTP | body `code` | 实测行为 | 含义 |
+|------|-------------|----------|------|
+| 503 | `video_queue_full` | `video queue is full, please retry later (request id: ...)`。2.5-flash 上观测到**连续 25 次提交、跨约 12 分钟全部被拒**（10:40–10:52），期间同 Key 的 v2.0 提交正常通过 | 免费 2.5-flash 队列饱和，按模型分池；被拒不产生任务、不消耗渲染配额，可安全重试 |
+| 503 | `fail_to_fetch_task` | 一次观测（11:05:13），25s 后重试即成功 | 上游内部瞬时故障，可重试 |
+| 503 | —（`message` 有值） | body `message` 为 `No available channel for model agnes-video-v2.0 under group default (distributor) (request id: ...)`（Issue #92，2026-10-12，同任务前 5 次**图片**调用也返回裸 503 `server error`） | 网关侧该模型当前无可用渠道/容量，属过载族瞬时错误；同样被拒不建任务、不消耗配额。与 `video_queue_full` 的区别是**没有队列语义码**，v7.1 起按「所有 503 归忙轨」统一覆盖 |
+| 429 | — | 未在本轮复现 | 现有换 Key 逻辑针对此码 |
+| 401 | — | 未在本轮复现 | Key 与域名不匹配（见 FAQ） |
+
+**关键区分**：`video_queue_full` 是「没排进队」，§3.2 的 `stuck_inference` 是「排进去了但渲染卡死」。两者用户侧表现完全不同，文案与重试策略也应不同。当前代码把 503 一律并入 `status_code >= 500` 分支（`core/api/agnes_video.py` `_submit_with_retry`），只记 `HTTP 503: server error`，**丢掉了 body 里的 `code`**。
+
+> **v7.0 已落地**（`docs/plans/v7.0/upstream_error_handling_plan.md` U1/U2）：503 分支解析 body `code`，命中
+> `video_queue_full` / `fail_to_fetch_task` 走独立退避轨道（v7.2 起＝默认 15 次重试，
+> `AGNES_VIDEO_BUSY_RETRY_ATTEMPTS`：**首跳 0s 贴着限流** + 之后固定间隔 + **次数**封顶），
+> 错误文案透出 `message` + `code`。
+
+### 4.0.1 已闭合缺口：body 无 `code` 的裸 503 曾走普通 5xx 配额（Issue #80 / #81 / #83 / #84 / #92，2026-10-02 起）
+
+**实测证据**（用户反馈的 `Model call error` 序列，#81，App 6.4.5 / Windows）：
+
+| 时间 | 错误 |
+|------|------|
+| 20:09:08 | `HTTP 503: server error` |
+| 20:09:38 | `HTTP 503: server error`（+30s） |
+| 20:10:39 | `HTTP 503: server error`（+60s） |
+| 20:12:09 | `HTTP 503: server error`（+90s） |
+| 20:14:10 | `HTTP 503: server error`（+120s） |
+| 20:16:40 | `RetriesExhausted: reference (2 images, keyframe fallback): max retries (5) exceeded`（+150s） |
+
+间隔精确等于 `retry_base_delay(30s) × (attempt+1)`，**证明这些 503 的 body 里没有可识别的 `code`**
+（否则会进 U1 队列轨道，表现为 30–60s 抖动、总预算 900s，而非 5 次线性退避）。
+
+**问题**：`_QUEUE_FULL_CODES` 只覆盖 `video_queue_full` / `fail_to_fetch_task` 两个已知码。上游在过载期
+也会返回**无 code 的裸 503**，此时应用只享 5 次普通配额（约 5.5 分钟），而本节实测队列饱和**可持续 12 分钟以上**
+——应用会在「再等一分钟就能排上」时提前放弃，用户侧表现为无端失败。
+
+**已实施（v7.1，2026-10-09 随 v7.1.0 发布）**：`HTTP 503` 且 `code` 为空/未知的响应已并入忙轨，与队列满共用同一轨道
+（v7.2 起＝次数封顶 `AGNES_VIDEO_BUSY_RETRY_ATTEMPTS`，默认 15；不再与普通 5xx 混用配额）。单测已补：
+`tests/test_upstream_error_handling.py::test_bare_503_enters_busy_track_not_capped_by_max_retries`
+（连续裸 503 → 调用次数可超过 `max_retries` 才成功）＋ `test_busy_track_interval_is_fixed`（首跳 0s、之后固定不增长）。
+
+> **Issue #92（2026-10-12）为该缺口在 7.0.5 上的又一例**：`max retries (5) exceeded` + 裸 503
+> `No available channel ...`。因用户版本早于 v7.1.0，处理口径是「外部容量故障 + 引导升级到 v7.1.0」，未改代码。
+> 注意忙轨只能覆盖「渠道稍后恢复」的情形：若上游长时间确实无该模型渠道，15 次重试仍会耗尽并抛通用技术报错
+> （裸 503 无队列语义，不下发 `error.video.queue_full` 文案键）。
+
+> **Issue #94（2026-10-13）为「渠道持续缺失」的首个坐实案例（7.1.0）**：503 body code 为
+> `model_not_found`（message 同 `No available channel ... under group default (distributor)`），
+> 忙轨按设计跑满 15 次/908s 后抛通用技术报错；用户 4 次手动重试各开新窗口仍同墙（持续 >1h），
+> 且同任务图片侧同时 503（`server busy`）→ 上游整体容量紧张而非视频队列单独饱和。本轮按外部故障
+> 处理未改代码；待办缺口：`model_not_found` 耗尽文案未比照 `video_queue_full` 给结构化异常 +
+> 多语言「换视频模型」引导（见 `docs/dev/issue_handling_process.md` §三 #94 行）。
+
+> 本轮（2026-10-02）按外部故障处理，仅回复用户 + 记档，未改代码。#80 与 #83 为同一用户（App 7.0.0，
+> 无 traceback），#81 为 6.4.5 且附完整 traceback，三例错误文案与路径一致（`reference` / keyframes）。
+
+### 4.0.2 `agnes-video-v2.0` 渠道下线（2026-10-14，#92/#94/#95 的 `model_not_found` 坐实为模型被除名）
+
+实测（2026-10-14 19:01–19:05 CST，国际站 `apihub.agnes-ai.com`，两把自有 Key 交叉验证）：
+
+| 探针 | 结果 |
+|------|------|
+| `GET /v1/models`（连续 4 次 + 第 2 把 Key） | 稳定返回 10 个模型，video 类仅 `agnes-video-2.5` 与 `agnes-video-2.5-flash`，**`agnes-video-v2.0` 已从目录除名**（首次查询曾返回 6 模型的过渡态，约 1 分钟内稳定为 10，疑为网关频道配置热更新） |
+| 提交 `agnes-video-v2.0`（5s / 768×1152） | 503 `model_not_found`：`No available channel for model agnes-video-v2.0 under group angel (distributor)`——本账户在 `angel` 组、#95 用户在 `default` 组，**两组同错 → 非分组问题，模型渠道被整体移除** |
+| 提交 `agnes-video-2.5`（2.5-flash 风格 payload） | 403 `insufficient_user_quota`（remaining ＄0.000000）——付费模型，与 v6.2.0 release notes「paid」一致 |
+| 提交 `agnes-video-2.5-flash`（×5，19:03–19:05 晚高峰） | 全部 503 `video_queue_full`，分钟级连发均被拒（免费队列按模型分池饱和，同 §4 既有结论） |
+
+结论与影响：
+
+- `model_not_found` 不是「渠道暂时不可用」而是 **v2.0 已被网关除名**：忙轨 15 次重试对该模型注定耗尽，用户侧任何配置（域名/分组/Key）都无法恢复。#92（default 组用户）、#94、#95 同为此签名。
+- **维护者澄清（2026-10-14）：2.5-flash 与收费无关**，用户出路＝任务设置切 2.5-flash + 错峰重试（北京 22:00–01:00 / 06:00–09:00）。#79 行「2.5-flash 为付费模型」的归因与本口径不一致，**已于 2026-10-15 在 `docs/dev/issue_handling_process.md` §三 加注修订**（标注「存疑待复核」，原记录保留不改；可能为当时分组定价差异）。
+- 项目侧待适配（本轮按用户决策仅记档，未改代码）：`core/config.py DEFAULT_VIDEO_MODEL`、6 条流水线默认 `video_model="agnes-video-v2.0"`、AGENTS.md / `docs/public/features*.md` / `docs/public/architecture*.md` 的「v2.0 免费」表述、`docs/dev/regression_test_plan.md` 中 v2.0 相关说明。
+- **A 类修复实施注（2026-10-15）**：上条「项目侧待适配」已随 A1 落地——`DEFAULT_VIDEO_MODEL` 改为 `agnes-video-2.5-flash`，5 条流水线默认同步，`VIDEO_MODEL_CAPABILITIES` 移除 v2.0 条目，`submit_video()` 删除 width/height/num_frames 旧协议分支（恒走 2.5 提交，`_get_frame_config`/`DURATION_PRESETS` 随之删除），`task_creation_routes` 时长校验收敛为 `VIDEO_25_DURATIONS`；AGENTS.md / `docs/public/features*` / `architecture*` 表述同步。竖屏躺倒维持现状（`AGNES_FIX_V25_PORTRAIT_ROTATION` 默认关）。
+
+### 4.0.3 「403 `insufficient_user_quota`」= 选错模型档位，不是免费额度被回收（2026-10-28，#104）
+
+issue #104（7.2.1，manuscript 在 `video_gen` 三次 403 `insufficient_user_quota` remaining ＄0.000000）触发本轮复测。
+同一请求体（`mode=text` / `seconds=4` / `size=720P` / `aspect_ratio=16:9`，仅 `model` 不同）、同一把 $0 余额 Key、同一时段连发：
+
+| 探针 | 结果 |
+|------|------|
+| `agnes-video-2.5-flash` | 503 `video_queue_full`（**免费档，$0 余额不受限**，仍只受队列容量约束） |
+| `agnes-video-2.5` | 403 `insufficient_user_quota`，`remaining: ＄0.000000`（付费档，余额为 0 时提交即被拒） |
+
+结论：
+
+- **403 配额错误与「免费额度被回收」无关**，只取决于提交的是哪个模型档位：免费档 `-flash` 永不走扣费路径，付费档 `agnes-video-2.5` 在余额 0 时必 403。2026-10-15 修订注「2.5-flash 与收费无关」由此再次得到正面对照。
+- 该错误是**确定性**的：不换模型重试必然复现（本轮 #104 的三次报错即 `manuscript_video.py` 的 `_SUBMIT_RETRIES=3` 白等），排查方向只有「切到 `-flash`」或「充值」两条。
+- 应用侧影响（待办，未改码）：403 未比照 `video_queue_full` 走结构化异常 + 多语言引导，失败面板仍显示上游原始 JSON；且确定性 403 未短路流水线层的 3 次提交重试。
+
+
+### 4.1 待实测：`video_queue_full` 是否按 Key 分池（U7，未验证）
+
+**已知**：单 Key 连续 25 次被拒（跨约 12 分钟）期间，同一 Key 的 v2.0 提交**正常通过** → 队列**按模型分池**。
+
+**未知**：多 Key 场景下，命中 503 `video_queue_full` 时**换 Key 能否立刻排进队**（即队列是否也按 Key 隔离），
+或只是全局同一池（换 Key 无帮助）。当前代码对 503 不换 Key（仅 429 换 Key）。
+
+**待实测步骤**（需要 ≥2 个可用 Key，且 2.5-flash 队列处于饱和时段）：
+
+```bash
+# 1) Key A 提交，观察是否 503 video_queue_full
+curl -sS -X POST https://apihub.agnes-ai.com/v1/videos \
+  -H "Authorization: Bearer $AGNES_API_KEY_A" -H "Content-Type: application/json" \
+  -d '{"model":"agnes-video-2.5-flash","prompt":"test","mode":"text","seconds":"5","size":"720P","aspect_ratio":"16:9"}'
+# 2) 被拒后立即用 Key B 提交同一请求，记录是否仍为 503 及 body code
+curl -sS -X POST https://apihub.agnes-ai.com/v1/videos \
+  -H "Authorization: Bearer $AGNES_API_KEY_B" -H "Content-Type: application/json" \
+  -d '{"model":"agnes-video-2.5-flash","prompt":"test","mode":"text","seconds":"5","size":"720P","aspect_ratio":"16:9"}'
+```
+
+**实测记录**（复测后填写本行）：`待补`。若证实按 Key 分池，再把 U1 的队列重试与「换 Key 立即重试」结合。
+
+---
+
+## 5. 分辨率与方向
+
+### 5.1 v2.0：标准档保真，非标准档被吸附
+
+| 请求 width×height | 产物容器（ffprobe 实测） | `perf_params`（推理内部） | 结论 |
+|---|---|---|---|
+| 768×1152（本项目竖屏档） | **768×1152** | 832×1088 | ✅ 保真 |
+| 1280×720（本项目横屏档，v7.0.2 true 16:9） | **1280×720** | 1280×704 | ✅ 保真 |
+| 1152×768（官网 demo 的"16:9"，实为 3:2） | **1088×832** | 1088×832 | ❌ 吸附到 ≈4:3，比例 1.50 → 1.31 |
+| 768×1360（官网 demo 的"9:16"） | **704×1280** | 704×1280 | ❌ 吸附，但恰好落回真 9:16 |
+
+规律：**请求命中常用标准像素档时容器即请求值；命中非标准值时上游按自己的 latent 桶重画**。所以 `perf_params` 不能用来校验产物分辨率，必须 ffprobe 产物文件（回归 F3 现行做法正确）。
+
+### 5.2 2.5-flash：竖屏（9:16）产物画面躺倒 —— 上游缺陷
+
+| `aspect_ratio` | 请求 | 产物容器 | 画面方向 |
+|---|---|---|---|
+| `16:9` | `size=720P, seconds=4` | **1280×720** | ✅ 正常 |
+| `9:16` | `size=720P, seconds=5` | **720×1280** | ❌ **内容顺时针躺倒 90°**：容器是竖的，像素是横屏构图；对产物做 `ffmpeg -vf transpose=2`（逆时针 90°）后得到正确的 1280×720 横屏画面 |
+| `3:4` | `size=720P, seconds=4` | **834×1112**（比例 0.75 保真；绝对像素不是 UI 标注的 720×960） | ✅ 正常 |
+| `1:1` | 未测 | — | — |
+
+即上游在 9:16 下**只交换了容器宽高，没有旋转像素**（产物内无 `display matrix` / rotation 元数据，已用 ffprobe 确认）。由于本项目 2.5-flash 分支发送的 payload 与 demo 完全一致（`mode=text` / `size=720P` / `aspect_ratio=9:16`），**自托管用户选竖屏同样会拿到躺倒的成片**，且会一路带到拼接与字幕叠加环节。
+
+**2.5 系列的分辨率规律**（与 v2.0 不同）：`aspect_ratio` 是枚举、`size` 固定 720P，**比例保真、绝对像素不保真**——`16:9` 恰好落在 1280×720，`3:4` 落在 834×1112。因此 UI 上给 2.5 系列标注的 `720×1280` / `720×960` 这类具体像素只是「比例示意」，不能当产物校验基准；回归校验该系列只能按比例（`docs/dev/regression_test_plan.md` F3 现行做法正确）。
+
+---
+
+## 6. 对内的直接影响（结论条目）
+
+1. **重试预算**：`video_queue_full` 可持续 12 分钟以上，而视频提交重试当前为 5 次 × 30s 递增退避（约 5 分钟），免费 2.5-flash 场景下大概率在排进队之前就放弃。
+2. **错误透出**：503 分支与轮询 `failed` 分支都没有提取 `error.message` / body `code`，用户与 `error_logs/` 看到的是 `HTTP 503: server error` 与整个 dict 的字面量，真实原因（队列满 / 上游 15 分钟卡死）丢失。这正是 Issue #75 用户被误导的根因。
+3. **竖屏成片方向**：2.5-flash + 9:16 需要后处理校正或明确提示，否则自托管长视频流水线会产出横躺的多场景成片。
+4. **回归判定**：分辨率校验必须读产物容器（现行正确），且**当前任何按宽高比做的校验都发现不了"容器对、内容躺倒"**这一缺陷。
+5. **轮询节奏**：`progress` 字段不可信，自适应间隔（`_adaptive_poll_interval`）只能按次数/时间推进，不要依赖进度值做判断。
+6. **404 可见性窗口会劣化**（2026-09-28 实测）：提交成功（200 + `video_id`）后，任务记录在 `/agnesapi` 可见前的 404 窗口平时 ~20s，上游高峰期可劣化到 **10min+ 甚至全程不可见**（三个观测样本 420s / 1100s+ 未出现）。因此轮询侧 404（`task not found`，带 request id 后缀的网关错误）按「任务未就绪」中间态处理（U9，v7.0.4）：不计入连续失败配额、不进 `error_logs`，仅周期性 info 日志，最终由 `max_poll_duration`（`AGNES_VIDEO_POLL_TIMEOUT`）整体兜底；超时异常不属于「服务端确认失败」，续传保留 `video_id`。
+7. **Key 与域名必须严格配对，同一任务提交/轮询必须同一把 Key**（v7.3）：见 §8。
+
+---
+
+## 8. Key 与域名严格配对 + 任务级 Key 绑定（v7.3）
+
+### 8.1 一次真实故障（任务 `4de1bcd26fda`，2026-10-09 提交）
+
+| 事实 | 证据 |
+|---|---|
+| 该任务在国内站（`cn`）提交成功并生成完成 | `GET https://api.agnes-ai.cn/agnesapi?video_id=task_XDdznBlK0Qqhq9oXOg1rGKaRsxNEFQkK` → 200，`status=completed`、`progress=100`、有 mp4 URL |
+| 本地轮询每次都 401 | `error_logs/*_video_poll_task.json`：URL 全是 `https://apihub.agnes-ai.com/agnesapi`，body `Invalid token` |
+| 连续 10 次 401 后判失败 | `task_state.json`：`Polling failed after 10 consecutive errors` |
+| 池内唯一 Key 绑 `cn`，全局域名仍是 `com` | `config.json`：`api_keys[0].domain="cn"`、`agnes_domain="com"` |
+
+用同一把 cn Key 分别打两个根域名：`apihub.agnes-ai.com` → 401 `Invalid token`；`api.agnes-ai.cn` → 200（任务早已完成）。
+
+**根因**：提交用 `get_base_url_for_key(key)`（按 Key 的域名），轮询用全局 `get_agnes_api_root()`（按 `agnes_domain`）。单 Key 场景下轮转逻辑等于空转，但轮询压根没把 Key 交给 URL 构造，于是 100% 确定性打错站点。`Invalid token` 文案会把人误导成「Key 失效」。
+
+### 8.2 修复后的约束
+
+1. **带 Key 的请求，域名只能由这个 Key 决定**：`get_api_root_for_key(key)` / `get_base_url_for_key(key)`（`core/config.py`）。`get_agnes_api_root()` 仅用于「尚未选定 Key」的全局操作。
+2. **视频任务在提交时记录所用 Key**（`AgnesVideoAPI._remember_task_key` → `key_for_task(video_id)`），`wait_for_video` / `_poll_task` 全程复用该 Key。
+3. **轮询不再换 Key**：429 也保持同一把（换 Key 可能打错站点，或看不到别人账号下的任务 → 404），只按自适应间隔退避重探。
+4. **轮询 401 也做归因登记**（`[KeyAuth]`，只记录不换池），配置页可见「Key 与域名不匹配」。
+5. **进程重启后**内存绑定丢失（旧任务 / 外部传入 `video_id`）：退化为「本次轮询固定一把 Key」并打 WARNING，无法自动推断提交 Key。
+
+### 8.3 排查提示
+
+出现 `401 Invalid token` 且 `error_logs` 里 URL 的域名与该 Key 绑定域名不一致时，改 Key 的域名绑定（配置页 Key 行）或改全局域名，不要先怀疑 Key 失效；两者必须指向同一站点。
+
+### 8.4 站点 Key 空间与「域名探测」判据（2026-11-05 实测，Issue #112）
+
+- **Key 空间按站点隔离**：仅国内站签发的 Key → `api.agnes-ai.cn` 200，而
+  `apihub.agnes-ai.cn`（`cn_bak`）与 `apihub.agnes-ai.com`（`com`）均 401
+  `Invalid token`。所以「某一步 401」最快的判别方式是拿这把 Key 三站各打一次
+  `GET /v1/models`：200 的那个站点才属于它，三个都 401 ＝ Key 失效 / 抄错 / 带空格。
+- **`/v1/models` 不能单独当鉴权判据**：`apihub.agnes-ai.com` 的该端点会被上游 CDN
+  缓存成**公开目录**——不带 Key、带任意假 Key 也偶发返回 200 与完整模型列表，同一
+  URL 加查询串或 `Cache-Control: no-cache` 才回到 401（实测 6 次里 3 次 200）。
+  只按状态码判定会把任何 Key 误判为「com 可用」。
+- **可靠探测端点**：`GET /v1/dashboard/billing/subscription` 在三个站点都强制鉴权
+  （无 Key / 坏 Key 一律 401，200 仅在 Key 与站点匹配时出现），且不消耗配额。
+  `web/routes/config_routes.py::_probe_domain` 已改为「首选该端点 + 假 Key 负对照
+  （假 Key 也 200 则该端点不可信）」。
+- **给用户的建议**：手动选域名，别依赖「自动探测域名」；旧实现会把任意 Key 绑到
+  `com`（含只在国内站有效的 Key），运行期复发 401。
+
+---
+
+## 9. 复测方法
+
+无需启动本项目服务，直接复放上游调用即可（与官网 demo 同链路）：
+
+```bash
+export AGNES_API_KEY=...
+# 提交（2.5-flash 竖屏）
+curl -sS -X POST https://apihub.agnes-ai.com/v1/videos \
+  -H "Authorization: Bearer $AGNES_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"agnes-video-2.5-flash","prompt":"...","mode":"text","seconds":"5","size":"720P","aspect_ratio":"9:16"}'
+# 轮询（务必用响应里的 video_id；2.5 系列带 model_name）
+curl -sS "https://apihub.agnes-ai.com/agnesapi?video_id=<video_id>&model_name=agnes-video-2.5-flash" \
+  -H "Authorization: Bearer $AGNES_API_KEY"
+# 产物方向
+ffprobe -hide_banner <file>.mp4          # 看 Stream 的 WxH 与有无 Display Matrix
+```
+
+v2.0 用 `{"model":"agnes-video-v2.0","prompt":"...","width":768,"height":1152,"num_frames":121,"frame_rate":24}`，轮询时**不带** `model_name`。
+
+---
+
+*创建：2026-09-28（Issue #75 排查过程中的实测沉淀）| 样本：v2.0 4 档成功、2.5-flash 3 档成功（9:16 / 16:9 / 3:4）、文生图 1 次、提交被拒约 40 次*
