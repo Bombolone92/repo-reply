@@ -1,0 +1,138 @@
+import fs from 'node:fs';
+
+// ---- Regression guard for the paid "remove branding" perk -------------------
+// Subscribers who tick "Remove the badge" publish without the "Made with
+// Puter" badge: the publish flow strips the runtime tag from the release's
+// HTML (see src/js/branding.js and stagePublishRelease in ui.js). A regex that misses a tag variant leaves a
+// paying user's badge up; one that over-matches deletes the user's own scripts.
+
+const read = (rel) => fs.readFileSync(new URL(rel, import.meta.url), 'utf8');
+const window = {};
+new Function('window', read('../src/js/branding.js'))(window);
+const B = window.Branding;
+const uiSrc = read('../src/js/ui.js');
+const viteSrc = read('../vite.config.js');
+
+let failures = 0;
+function check(name, cond) {
+    if (cond) console.log('ok   - ' + name);
+    else { console.error('FAIL - ' + name); failures++; }
+}
+
+const TAG = '<script src="https://builder.puter.com/runtime.js" defer></script>';
+const page = `<!doctype html>\n<html>\n<head>\n    <title>x</title>\n    ${TAG}\n    <script src="app.js"></script>\n</head>\n<body></body>\n</html>\n`;
+
+const r = B.stripRuntimeTags(page);
+check('strips the canonical tag', r.changed && !r.text.includes('builder.puter.com'));
+check('leaves the line clean (no blank line behind)', r.text.includes('<title>x</title>\n    <script src="app.js"></script>'));
+check('keeps the app\'s own scripts', r.text.includes('<script src="app.js"></script>'));
+check('strips the legacy badge.js tag',
+    !B.stripRuntimeTags('<script src="https://builder.puter.com/badge.js" defer></script>').text.includes('badge.js'));
+check('strips single-quoted / attribute-first / no-defer variants', [
+    "<script src='https://builder.puter.com/runtime.js' defer></script>",
+    '<script defer src="https://builder.puter.com/runtime.js"></script>',
+    '<SCRIPT SRC="https://builder.puter.com/runtime.js"></SCRIPT>',
+    '<script src="https://builder.puter.com/runtime.js?v=2" defer></script>',
+].every((t) => B.stripRuntimeTags(t).text === ''));
+check('strips a page that includes the tag twice', !B.stripRuntimeTags(TAG + '\n' + TAG).text.includes('runtime'));
+check('leaves other builder.puter.com scripts alone',
+    !B.stripRuntimeTags('<script src="https://builder.puter.com/other.js"></script>').changed);
+check('does not eat a following inline script',
+    B.stripRuntimeTags(TAG + '<script>window.x=1</script>').text === '<script>window.x=1</script>');
+check('leaves a look-alike filename alone (runtime.js-custom)',
+    !B.stripRuntimeTags('<script src="https://builder.puter.com/runtime.js-custom"></script>').changed);
+check('leaves a data-src attribute alone',
+    !B.stripRuntimeTags('<script data-src="https://builder.puter.com/runtime.js" src="app.js"></script>').changed);
+check('still strips when data-src sits beside the real src',
+    B.stripRuntimeTags('<script data-x="1" src="https://builder.puter.com/runtime.js" defer></script>').text === '');
+check('no tag → unchanged', !B.stripRuntimeTags('<p>hi</p>').changed);
+check('hasRuntimeTag true/false', B.hasRuntimeTag(page) && !B.hasRuntimeTag('<p>hi</p>'));
+check('hasRuntimeTag is stable across calls (global regex lastIndex)',
+    B.hasRuntimeTag(page) && B.hasRuntimeTag(page) && B.hasRuntimeTag(page));
+
+check('isSubscribed: subscribed true', B.isSubscribed({ username: 'a', subscribed: true }));
+check('isSubscribed: false / missing / null', !B.isSubscribed({ subscribed: false }) && !B.isSubscribed({}) && !B.isSubscribed(null));
+check('isSubscribed: truthy non-boolean is not enough', !B.isSubscribed({ subscribed: 'yes' }));
+check('isSubscribed: temp user never counts', !B.isSubscribed({ is_temp: true, subscribed: true }));
+check('upgrade url for a refusal carries what was refused',
+    B.upgradeUrl({ reason: 'funds', appID: 'app-1', method: 'a::b' }) === 'https://puter.com/dashboard/?upgrade=funds&upgrade_app=app-1&upgrade_method=a%3A%3Ab#home');
+check('upgrade url leaves out what it is not given',
+    B.upgradeUrl({ reason: 'funds', appID: 'app-1' }) === 'https://puter.com/dashboard/?upgrade=funds&upgrade_app=app-1#home' &&
+    B.upgradeUrl() === 'https://puter.com/dashboard/#home');
+check('the Upgrade dialog opens the funds upgrade for this app, with no refused method',
+    uiSrc.includes("htmlEscape(window.Branding.upgradeUrl({ reason: 'funds', appID: window.puter?.appID }))"));
+
+// Wiring: the module is bundled, and staging a release strips only when a
+// subscriber ticked the box. Never automatically.
+check('branding.js is in the bundle', viteSrc.includes("'js/branding.js'"));
+check('stagePublishRelease strips only when ticked by a subscriber, on a fresh plan check',
+    /const user = window\.refreshUserPlan \? await window\.refreshUserPlan\(\) : window\.user;\s*const branding = removeBadge && window\.Branding\?\.isSubscribed\(user\) \? 'removed' : 'kept';\s*if \(branding === 'removed'\) await stripBrandingFromRelease\(releaseDir\)/.test(uiSrc));
+check('removeBadge defaults to off', uiSrc.includes('async function stagePublishRelease(chatId, appDir, srcPath, { removeBadge = false } = {})'));
+check('doPublish passes the box state to staging', uiSrc.includes('stagePublishRelease(chatId, appDir, path, { removeBadge })'));
+check('the box is locked for free users, with an Upgrade button',
+    /class="publish-remove-badge"\$\{checked \? ' checked' : ''\}\$\{paid \? '' : ' disabled'\}/.test(uiSrc) &&
+    uiSrc.includes('data-action="upgrade" data-source="publish_panel">Upgrade</button>'));
+check('the box is shown in both the first-publish and live views',
+    (uiSrc.match(/publishBadgeToggleHtml\(\) \+/g) || []).length === 2);
+check('settings asks before switching away from a running build',
+    /async function publishFromSettings\(\) \{[\s\S]*?confirmLeaveActiveChat\(\)[\s\S]*?close\(\);/.test(uiSrc));
+check('the chat card is skipped for a stopped turn',
+    read('../src/tools/chat_ui/upgrade.js').includes('!window.isAborted?.(state?.abortController) && !window.isStaleTurn?.(state)'));
+
+// The upgrade funnel's analytics: every step and entry point is reported.
+const upgradeToolSrcForTracking = read('../src/tools/chat_ui/upgrade.js');
+for (const ev of ['Upgrade Prompt Shown', 'Upgrade Opened', 'Upgrade Clicked', 'Upgrade Completed']) {
+    check(`tracks '${ev}'`, uiSrc.includes(`'${ev}'`) || upgradeToolSrcForTracking.includes(`'${ev}'`));
+}
+// The card's impression carries the source of the perk it offers: 'chat' for
+// the badge (as before the code editor), 'chat_code_editor' for editing code.
+check('the chat card reports its impression, per perk',
+    upgradeToolSrcForTracking.includes("'Upgrade Prompt Shown', { source: CARDS[feature].source }") &&
+    /badge: \{[^}]*source: 'chat' \}/.test(upgradeToolSrcForTracking) &&
+    /code_editor: \{[^}]*source: 'chat_code_editor' \}/.test(upgradeToolSrcForTracking));
+check('the card button opens the dialog with its own source',
+    uiSrc.includes("openUpgradeModal($(this).attr('data-source') || 'chat')") &&
+    upgradeToolSrcForTracking.includes('data-source="${card.source}"'));
+check('chat badge requests are tracked', upgradeToolSrcForTracking.includes("'Badge Removal Requested'"));
+check('chat code-editing requests are tracked', upgradeToolSrcForTracking.includes("'Code Editing Requested'"));
+// The code editor's case: a required feature while the flag is on, the badge
+// otherwise (and for offers saved before it existed).
+check('OfferUpgrade asks which perk when the code editor ships',
+    upgradeToolSrcForTracking.includes('enum: ["badge", "code_editor"]') && upgradeToolSrcForTracking.includes('required: ["feature"]'));
+check('anything but code_editor is the badge',
+    upgradeToolSrcForTracking.includes("args.feature === 'code_editor' ? 'code_editor' : 'badge'"));
+check('a reloaded chat replays the card for its perk',
+    read('../src/js/app.js').includes('window.renderUpgradeCard?.({ feature: toolResponse.feature })'));
+check('the tool never limits changes made in chat', upgradeToolSrcForTracking.includes('keep making every change the user asks for in chat, on any plan'));
+check('the dialog lists the code editor perk, first when opened from the editor',
+    uiSrc.includes("{ id: 'code', title: 'Edit the code yourself',") && uiSrc.includes("const lead = forCode ? 'code'"));
+check('upgrading from the editor offers to start editing', uiSrc.includes('upgrade-start-editing'));
+check('Project Published carries branding', /'Project Published', \{[^}]*branding/.test(uiSrc));
+check('usage-limit upgrade button is tracked', uiSrc.includes("'Upgrade Clicked', { source: 'usage_limit' }"));
+
+// A free user asking the AI to drop the badge gets the upgrade offer, not an edit.
+const promptSrc = read('../src/js/prompt.js');
+const upgradeToolSrc = read('../src/tools/chat_ui/upgrade.js');
+check('prompt routes badge-removal requests to OfferUpgrade', promptSrc.includes('Call the OfferUpgrade tool instead'));
+check('OfferUpgrade tool is defined and bundled',
+    upgradeToolSrc.includes('name: "OfferUpgrade"') && viteSrc.includes("'tools/chat_ui/upgrade.js'"));
+check('a reloaded chat re-renders the upgrade card', read('../src/js/app.js').includes('toolResponse.__upgrade_offer'));
+// The Publish button the AI can put in the chat (OfferPublish) has no badge
+// box: publishing from it keeps the badge. "Open Publish" read as either
+// button, so a subscriber who asked for no badge could publish with it.
+{
+    const publishToolSrc = read('../src/tools/chat_ui/publish.js');
+    check('OfferUpgrade sends the user to the toolbar\'s Publish for the badge, in both of its answers',
+        (upgradeToolSrc.match(/Publish in the preview toolbar/g) || []).length === 2);
+    check('OfferPublish tells the AI its button has no badge option',
+        /The button has no option to remove the \\"Made with Puter\\" badge/.test(publishToolSrc));
+}
+
+// Paid users see their benefits, and a detected upgrade shows the success dialog.
+check('toolbar shows Benefits on a paid plan', uiSrc.includes("paidPlan ? 'Benefits' : 'Upgrade'"));
+check('paid dialog points to a higher plan', uiSrc.includes('Need more credits? Move to a higher plan on Puter.'));
+check('a detected upgrade opens the success dialog', uiSrc.includes('openUpgradeModal(source, { justUpgraded: true })'));
+check('a paid user\'s See plans click never waits for an upgrade', uiSrc.includes('if (!paid) setUpgradePending(source);'));
+
+if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
+console.log('\nall branding checks passed');

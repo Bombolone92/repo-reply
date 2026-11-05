@@ -1,0 +1,494 @@
+const showError = (placeholderMessage, errorText) => {
+    if (placeholderMessage && placeholderMessage.length) {
+        // Reuse the same friendly-text + styled-card treatment as chat-level
+        // errors (appendErrorMessage), but in place of this tool's progress
+        // placeholder. Swap the ai-message styling for the red error card.
+        const friendly = friendlyErrorMessage(extractErrorText(errorText));
+        placeholderMessage.removeClass('ai-message').addClass('error-message');
+        placeholderMessage.find('.message-content').html(errorCardHTML(friendly));
+    }
+};
+
+window.tools = [];
+
+// The builder's own tools a turn offers: every registered one, less any whose
+// available() says it is switched off (a feature flag). Registration never
+// depends on a flag, so the shipped tool list stays the same for checks that
+// count it (scripts/test-mcp.mjs).
+window.builtinTools = function() {
+    return window.tools.filter(t => !t || typeof t.available !== 'function' || t.available());
+};
+
+
+// The tools for a turn on `modelId`: the builder's own, then the MCP tools
+// that model can take (see ModelCore.turnTools).
+window.getTurnTools = function(modelId) {
+    const mcp = window.mcpManager?.getTools() || [];
+    const own = window.builtinTools();
+    return window.ModelCore ? window.ModelCore.turnTools(modelId, own, mcp) : [...own, ...mcp];
+};
+// The MCP tools left out of a turn on `modelId` ({label, server}), which the
+// model is told about (ModelCore.unavailableToolsNote).
+window.getUnavailableTools = function(modelId) {
+    const mcp = window.mcpManager?.getTools() || [];
+    return window.ModelCore ? window.ModelCore.unavailableTools(modelId, mcp) : [];
+};
+
+// Tools that never write the project's files, so an early preview cache clear
+// (startEarlyPreviewClear in ui.js) still covers everything after they run.
+// Any other tool is taken to write, MCP tools included, since a connected
+// server could write files too. Leaving a read-only tool off this list only
+// costs an extra clear, while a writing tool on it would leave the preview
+// stale.
+const PREVIEW_SAFE_TOOLS = new Set(['stat', 'readdir', 'ReadTextFile', 'SearchFiles', 'ViewImage', 'ViewDocument',
+    'ShowImage', 'update_preview', 'TodoWrite', 'AskClarifyingQuestions', 'OfferUpgrade', 'list_workers', 'get_worker',
+    'set_secret', 'set_email_sender_name', 'delete_worker', 'FetchExternalResource', 'OfferPublish', 'OfferAddressChange',
+    // Writes only the project's hidden .puter/ folder, which the preview never loads.
+    'AppTests']);
+
+// The answer to a tool call whose reply hit the output limit before its
+// arguments were complete. Puter turns cut-off JSON into {}, so running it
+// would fail on a missing field at best, and at worst write an empty file.
+const CUT_OFF_TOOL_ERROR = 'This call was cut off at the output limit before its arguments were complete, so it was not run. Send it again. If it was a large file, write it in smaller parts (a shorter write, then edits).';
+
+// The answer to an update_preview call that comes after a failed file change
+// in the same reply. The model wrote every call before any ran, so the check
+// would test a change that is only partly in, and a problem it found would use
+// up one of the turn's fix attempts (UPDATE_PREVIEW_MAX_ATTEMPTS). If the model
+// never checks again, the turn's end still refreshes the preview
+// (flushPreviewRefresh in ui.js).
+const SKIPPED_PREVIEW_ERROR = 'Not run, because an earlier call in this reply failed to change the files, so the preview would show only part of the change. Fix that call, then call update_preview again.';
+
+// Saving a deployed worker's source (workers/<name>.js, the file create_worker
+// deploys from) is how it is updated. Puter redeploys it from the saved file.
+// Every save of one, by the AI's edit, multi_edit and write, a Code view save
+// or a GitHub pull, looks up the worker before the save (workerSaveTarget),
+// stamps a canary token onto the code as it writes it (stampWorkerSave, and
+// stampWorkerCanary in helpers.js), and after the save waits until the worker
+// serves that token (workerSaveResult). So the AI's result tells it whether
+// its change is live, and it never resends the whole worker to create_worker
+// just to deploy an edit.
+// Puter documents up to 30 seconds for a deploy to reach every edge.
+window.workerCanaryTiming = { pollMs: 500, limitMs: 30000 };
+
+// The deployed worker this project runs from `path`: { name, url, path }.
+// { lookupFailed: true } when the worker list can't be read, null for any
+// other file.
+window.workerSaveTarget = async function(path, state) {
+    const root = window.projectRootDir(state);
+    if (!root || typeof path !== 'string' || path.indexOf(root + '/') !== 0) return null;
+    if (!window.EditorCore?.classify(path.slice(root.length + 1)).backend) return null;
+    let owned;
+    try { owned = window.WorkerOwnership.ownedWorkers(await puter.workers.list(), root); }
+    catch (e) { return { lookupFailed: true }; }
+    const worker = owned.find(w => window.normalizePosixPath(w.file_path) === path);
+    if (!worker || !worker.url) return null;
+    return { name: worker.name, url: worker.url, path };
+};
+
+// `text` stamped with a fresh canary token for `target`'s save, kept on the
+// target for workerSaveResult. Called inside the file's write lock, so tokens
+// are made in the order the saves are written. A token starts with the time it
+// was made, so a later save's token sorts after it.
+window.stampWorkerSave = function(target, text) {
+    if (!target || !target.url) return text;
+    target.token = Date.now().toString(36).padStart(9, '0') + window.WorkerOwnership.randomSuffix();
+    return window.stampWorkerCanary(text, target.token);
+};
+
+// Whether another edit, multi_edit or write later in the same reply saves the
+// file at `path` again. Only the last save of a file in a reply is waited on.
+function savedAgainThisReply(state, path) {
+    return (state?.laterToolCalls || []).some(t => {
+        if (!t || !['edit', 'multi_edit', 'write'].includes(t.name) || !t.input) return false;
+        try { return window.assertPathInProject(t.input.path, state) === path; } catch (e) { return false; }
+    });
+}
+
+// Whether the worker serving canary `served` runs the save that stamped
+// `token`, or a later save of the same file (one made while this one waited).
+function servesSave(served, token) {
+    return served === token || (/^[0-9a-z]{15}$/.test(served || '') && served.slice(0, 9) > token.slice(0, 9));
+}
+
+// The canary the worker at `url` serves, or null when it doesn't answer.
+async function readWorkerCanary(url) {
+    const bust = '?__pv=' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    try {
+        const signal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined;
+        const resp = await fetch(url.replace(/\/+$/, '') + window.WORKER_CANARY_PATH + bust, { cache: 'no-store', signal });
+        return resp.ok ? (await resp.text()).trim() : null;
+    } catch (e) { return null; }
+}
+
+// The `worker` field of a worker save's result, once the worker serves the
+// saved `code` or the wait runs out. Null when the file isn't a worker's.
+window.workerSaveResult = async function(target, code, state) {
+    if (!target) return null;
+    if (target.lookupFailed) {
+        return { live: false, note: "Builder couldn't look up this project's workers, so it couldn't check whether this save is live." };
+    }
+    if (!target.token) return null;
+    // A save the same reply makes again is checked there, once, so an edit
+    // halfway through a change isn't compiled or waited on.
+    if (savedAgainThisReply(state, target.path)) {
+        // Kept in case that later save fails (skippedWorkerSaveResult).
+        state.uncheckedWorkerSaves?.set(target.path, { target, code });
+        return { name: target.name, url: target.url,
+            note: "Not checked, since a later call in this reply saves this file again. That call's result says whether the worker is serving it." };
+    }
+    // Puter reports nothing about a save it can't deploy, and keeps running
+    // the previous code. It runs a worker as a plain script (it rejects
+    // import, export and top-level await), so code that doesn't compile as a
+    // plain function body here won't deploy there either, and there is
+    // nothing to wait for. This compiles the code without running it.
+    try { new Function(code); }
+    catch (e) {
+        return { name: target.name, live: false, error: e && e.message ? (e.name || 'Error') + ': ' + e.message : String(e),
+            note: "The file is saved, but it doesn't parse, so the worker is still running its previous code. Fix the error and save the file again." };
+    }
+    const { pollMs, limitMs } = window.workerCanaryTiming;
+    const deadline = Date.now() + limitMs;
+    for (;;) {
+        if (servesSave(await readWorkerCanary(target.url), target.token)) {
+            return { name: target.name, url: target.url, live: true };
+        }
+        if (Date.now() >= deadline || state?.abortController?.signal?.aborted) break;
+        await new Promise(r => setTimeout(r, pollMs));
+    }
+    return { name: target.name, live: false,
+        note: `The file is saved, but the worker wasn't serving it yet after ${Math.round(limitMs / 1000)} seconds. It may still be updating, or still running its previous code.` };
+};
+
+// The check workerSaveResult skipped for an earlier save of `call`'s file in
+// this reply, run once `call`, a later save of it, has failed and no other
+// save of the file is left in the reply. Otherwise nothing would say whether
+// the worker serves the earlier save. Null when there is none.
+window.skippedWorkerSaveResult = async function(call, state) {
+    const skipped = state?.uncheckedWorkerSaves;
+    if (!skipped || !skipped.size || !call || !call.input) return null;
+    let path;
+    try { path = window.assertPathInProject(call.input.path, state); } catch (e) { return null; }
+    const save = skipped.get(path);
+    if (!save || savedAgainThisReply(state, path)) return null;
+    skipped.delete(path);
+    const result = await window.workerSaveResult(save.target, save.code, state);
+    const note = 'This call changed nothing, so this is the check for the earlier save of this file in this reply.';
+    return { ...result, note: result.note ? note + ' ' + result.note : note };
+};
+
+window.findTool = function(name, state) {
+    return (state?.tools || window.getTurnTools()).find(tool => tool.function.name === name);
+}
+
+window.executeFunction = async function(functionName, args, state) {
+    const tool = window.findTool(functionName, state);
+    if (!tool) {
+        throw new Error(`Unknown function: ${functionName}`);
+    }
+    return await tool.exec(args, state);
+}
+
+// Helper function to add tool result to history
+function addToolResultToHistory(history, toolCallId, toolResponse, isError = false) {
+    // A tool may return content blocks for the model to see (e.g. an image) by
+    // returning { __contentBlocks: [...] }. Pass those through as the tool_result
+    // content array instead of stringifying it (used by ViewImage). Everything
+    // else is serialized to a JSON string as before.
+    const hasBlocks = !isError && toolResponse && typeof toolResponse === 'object'
+        && Array.isArray(toolResponse.__contentBlocks);
+    history.push({
+        role: "user",
+        content: {
+            "type": "tool_result",
+            tool_use_id: toolCallId,
+            content: hasBlocks ? toolResponse.__contentBlocks : JSON.stringify(toolResponse),
+            ...(isError && { is_error: true })
+        }
+    });
+}
+
+// The tool_result message for `toolUseId` in `history`, newest first, or null.
+function findToolResult(history, toolUseId) {
+    if (!Array.isArray(history) || toolUseId == null) return null;
+    for (let i = history.length - 1; i >= 0; i--) {
+        const m = history[i];
+        const c = m && m.content;
+        if (m && m.role === 'user' && c && typeof c === 'object' && !Array.isArray(c)
+            && c.type === 'tool_result' && c.tool_use_id === toolUseId) return m;
+    }
+    return null;
+}
+
+// True when `history` already holds a tool_result for `toolUseId` — i.e. the
+// interrupted-turn repair (repairDanglingToolUses in app.js) got there first.
+function hasToolResultFor(history, toolUseId) {
+    return !!findToolResult(history, toolUseId);
+}
+window.hasToolResultFor = hasToolResultFor;
+
+// The words beside the dots while the model works out its next step. Only a
+// preview check says what that is: after a clean one comes the closing line,
+// after one that found errors comes a fix, and after one still failing on its
+// last try the model explains. "Working" in the wait after any other call
+// read as going backwards after "Applying changes". '' otherwise, and the
+// dots say "Working" if the wait lasts (setSpinnerLabel in helpers.js).
+function nextStepLabel(toolCalls, history) {
+    const check = toolCalls.find(t => t && t.name === 'update_preview');
+    if (!check) return '';
+    let result = null;
+    try { result = JSON.parse(findToolResult(history, check.id).content.content); } catch (e) { /* not a check's result */ }
+    // A check that failed or didn't run (SKIPPED_PREVIEW_ERROR) says nothing
+    // about what comes next.
+    if (result && result.error) return '';
+    const status = result && result.verification && result.verification.status;
+    return status === 'errors_detected' || status === 'tests_failed' ? 'Fixing a problem' : 'Finishing up';
+}
+
+async function handleToolCalls(completion, isTopLevel = false, c) {
+    // Extract text content
+    const textContent = completion.text;
+    delete completion.text;
+
+    // Normalize completion to array. A batch (every tool call of one reply,
+    // see handleMessageStream) arrives as an array of chunks, each still
+    // carrying its own empty `text`.
+    if(!Array.isArray(completion))
+        completion = [completion];
+    // Calls handleMessageStream found cut off at the output limit (_cutOff).
+    // The marker is bookkeeping, never stored.
+    const cutOffIds = new Set();
+    for (const block of completion) {
+        if (!block || typeof block !== 'object') continue;
+        if ('text' in block && block.type === 'tool_use') delete block.text;
+        if (block._cutOff) cutOffIds.add(block.id);
+        delete block._cutOff;
+    }
+
+    // Add text content to history if present. Suppress the UI bubble while
+    // the progress checklist has unfinished items, so mid-turn narration that
+    // arrives packaged with a tool_use doesn't clutter the chat. History is
+    // preserved so the model's own context stays intact.
+    if (textContent && textContent.trim()) {
+        const messageId = generateMessageId();
+        c.chatHistory.push({
+            role: "assistant",
+            content: textContent,
+            messageId: messageId
+        });
+        if (!hasActiveTodos()) {
+            appendMessage(textContent, false, false, false, false, messageId);
+        }
+    }
+
+    // Add tool_use to history, stamped with the model that made the calls so a
+    // later request to another model can drop provider-only fields
+    // (ModelCore.shapeHistory, which also strips the stamp before sending).
+    c.chatHistory.push({
+        role: "assistant",
+        content: completion.length === 1 ? completion[0] : completion,
+        ...(c.model ? { model: c.model } : {})
+    });
+
+    // Process tool calls - execute all tools
+    const toolCalls = completion.filter(t => t && t.type === 'tool_use');
+
+    // Files read whole in this round whose results were kept. Their Code
+    // view overwrite guards lift once the round is over, and only while this
+    // turn's history is still the open chat's, the one the next request
+    // sends. A stopped turn's late result is kept that way too, while one a
+    // new message already replaced is not (see below).
+    c.readsThisRound = [];
+    const liftReadGuards = () => {
+        if (typeof chatHistory !== 'undefined' && c.chatHistory === chatHistory) {
+            for (const p of c.readsThisRound) window.CodeEditor?.noteModelRead?.(p);
+        }
+        c.readsThisRound = [];
+    };
+    // This reply's skipped worker checks (see skippedWorkerSaveResult), and
+    // whether a call that changes files failed, which stops a later
+    // update_preview (SKIPPED_PREVIEW_ERROR).
+    c.uncheckedWorkerSaves = new Map();
+    let changeFailed = false;
+
+    // Execute all tools and collect results
+    for (const [index, toolCall] of toolCalls.entries()) {
+        // The calls still to run in this reply (see savedAgainThisReply).
+        c.laterToolCalls = toolCalls.slice(index + 1).filter(t => t && !cutOffIds.has(t.id));
+        // Check for abort (or a chat switch) before each tool execution
+        if (isAborted(c.abortController) || isStaleTurn(c)) {
+            liftReadGuards();
+            return { error: 'Aborted', history: c.chatHistory };
+        }
+
+        if (cutOffIds.has(toolCall.id)) {
+            if (!hasToolResultFor(c.chatHistory, toolCall.id)) {
+                addToolResultToHistory(c.chatHistory, toolCall.id, { error: CUT_OFF_TOOL_ERROR }, true);
+            }
+            continue;
+        }
+
+        if (toolCall.name === 'update_preview' && changeFailed) {
+            if (!hasToolResultFor(c.chatHistory, toolCall.id)) {
+                addToolResultToHistory(c.chatHistory, toolCall.id, { error: SKIPPED_PREVIEW_ERROR }, true);
+            }
+            continue;
+        }
+
+        // A clear started before this write wouldn't cover it (see
+        // startEarlyPreviewClear in ui.js).
+        if (!PREVIEW_SAFE_TOOLS.has(toolCall.name)) window.dropEarlyPreviewClear?.();
+
+        // Tell the background-freeze watchdog (app.js) a local tool is running:
+        // the turn isn't waiting on its stream meanwhile, so silence isn't a stall.
+        const watchdogKey = c.abortController;
+        if (!isStaleTurn(c)) window.noteToolExec?.(watchdogKey, true);
+        try {
+            // Execute the tool
+            if (toolCall.name === 'ReadTextFile') c.lastFullRead = null;
+            const toolResponse = await executeFunction(toolCall.name, toolCall.input, c);
+            const fullRead = toolCall.name === 'ReadTextFile' ? c.lastFullRead : null;
+            // A file the AI renamed, copied or deleted takes its Code view
+            // overwrite guard with it (only once the operation succeeded). A
+            // move reports each file as it lands (move.js), since one that
+            // fails partway has still moved the files before it.
+            if (toolCall.name !== 'move') window.CodeEditor?.onModelFileOp?.(toolCall.name, toolCall.input, c);
+            // The exec may have outlived its turn: the user hit Stop mid-tool
+            // and sent a new message, whose setup already synthesized a result
+            // for this id (repairDanglingToolUses) and appended their prompt.
+            // A second result for the same id, landing after that prompt,
+            // breaks the tool_use/tool_result adjacency the API enforces —
+            // every later request in the chat was rejected, for good.
+            if (!hasToolResultFor(c.chatHistory, toolCall.id)) {
+                addToolResultToHistory(c.chatHistory, toolCall.id, toolResponse,
+                    toolCall.name.startsWith('mcp_') && toolResponse?.isError === true);
+                if (fullRead) c.readsThisRound.push(fullRead);
+            }
+        } catch (error) {
+            // Extract error message
+            const errorMessage = error.error?.message || error.message || error;
+            const failed = { error: errorMessage };
+            if (!window.isMutatingTool || window.isMutatingTool(toolCall.name)) {
+                changeFailed = true;
+                const worker = await window.skippedWorkerSaveResult?.(toolCall, c);
+                if (worker) failed.worker = worker;
+            }
+            // Store error result in history (same guard as above)
+            if (!hasToolResultFor(c.chatHistory, toolCall.id)) {
+                addToolResultToHistory(c.chatHistory, toolCall.id, failed, true);
+            }
+        } finally {
+            window.noteToolExec?.(watchdogKey, false);
+            // Track project-file changes so the turn can be snapshotted for
+            // version history. Done in finally because multi-path tools (move,
+            // mkdir) can mutate the filesystem and then throw — the change still
+            // happened. No-op for non-mutating tool names.
+            window.markProjectModified?.(toolCall.name, c.currentChatId);
+            // Counted for the Usage Limit Hit event (limitHitTurnProps).
+            if (c.turnStats && toolCall.name === 'update_preview') c.turnStats.previewChecks++;
+            if (!window.isMutatingTool || window.isMutatingTool(toolCall.name)) {
+                // Files open in the Code view follow what the AI just wrote: a
+                // clean one reloads, one with unsaved edits shows a conflict.
+                window.CodeEditor?.onToolWrite?.(toolCall.name, c.currentChatId);
+            }
+        }
+    }
+    c.laterToolCalls = null;
+    liftReadGuards();
+
+    // Checkpoint this round's results (the assistant tool_use + every tool_result
+    // just pushed into c.chatHistory) BEFORE the throw-prone next-round
+    // puter.ai.chat below. Coalesced + non-blocking, so it's cheap. This is the
+    // crash-safety net for a long multi-round turn: if the next round throws, or
+    // the user refreshes while the AI is still working, the completed rounds are
+    // already on disk rather than waiting for an end-of-turn save that never runs.
+    // Not for a turn that was stopped or left while its tool ran: its save —
+    // interrupted:true, and possibly an older copy of the history if the chat
+    // was reloaded meanwhile — could land after a newer turn's final save,
+    // bringing back a Resume banner on a finished build or rolling back newer
+    // messages. The turn's own end-of-turn save (which knows when a newer turn
+    // owns the chat) persists what this round added.
+    if (toolCalls.length > 0 && !isAborted(c.abortController) && !isStaleTurn(c)) {
+        scheduleSaveCurrentChat(c);
+    }
+
+    // The round's writes are done. Start clearing the preview's cache for them
+    // while the model works out its next step, usually update_preview, which
+    // then has less to wait for (see startEarlyPreviewClear in ui.js). Not
+    // after a round that already ran update_preview, whose refresh covered it.
+    if (!isAborted(c.abortController) && !isStaleTurn(c)
+        && toolCalls.some(t => !cutOffIds.has(t.id) && !PREVIEW_SAFE_TOOLS.has(t.name))
+        && !toolCalls.some(t => t.name === 'update_preview')) {
+        window.startEarlyPreviewClear?.();
+    }
+
+    // Bail BEFORE touching the spinner. showSpinner() hands back whatever dots
+    // are already on screen, and by now those can belong to another turn: a
+    // Stopped turn whose tool only just returned may be running under a newer
+    // turn in this chat (or after a switch, in the chat now open) — removing
+    // "its" spinner took the live turn's activity indicator away.
+    if (isAborted(c.abortController) || isStaleTurn(c)) {
+        return { error: 'Aborted', history: c.chatHistory };
+    }
+    spinner = showSpinner();
+    // The round's calls have run, so their status no longer applies while the
+    // model works out its next step (nextStepLabel).
+    window.setSpinnerLabel?.(nextStepLabel(toolCalls, c.chatHistory));
+    // Only create a new AbortController if one doesn't already exist
+    // (it's created in sendChatMessage for top-level calls, and we don't want to overwrite it)
+    if (!c.abortController) {
+        c.abortController = new AbortController();
+    }
+
+    // Build the next-round request from the TURN's captured history (c.chatHistory),
+    // not the global `chatHistory` — a mid-turn chat switch reassigns the global,
+    // and feeding the wrong conversation to the model here would corrupt the turn.
+    // abortableAwait: the SDK ignores the signal option, so the open must be
+    // raced against the signal locally or an abort can't unstick a dead open.
+    // The turn's model (c.model, fixed when the turn started) drives the
+    // history shape and the request options for every round.
+    const stream = await abortableAwait(puter.ai.chat(
+        prepareHistoryForAI(c.chatHistory, c.model, { unavailableTools: c.unavailableTools }),
+        window.ModelCore.buildChatOptions(c.model, { tools: c.tools || window.builtinTools(), signal: c.abortController.signal })
+    ), c.abortController.signal);
+    // Round handoff = liveness for the background-freeze watchdog (see
+    // mobile-lifecycle-keepalive in app.js). Guarded so a stale turn's rounds
+    // can't mask a stall of the chat the user actually has open.
+    if (!isStaleTurn(c)) window.noteTurnActivity?.();
+
+    // Don't remove spinner here - keep it visible during tool calls
+    // It will be removed when we actually get text content
+    c.currentMessageContent = '';
+    c.currentMessage = null;
+
+    // Process stream responses
+    await handleMessageStream(stream, c)
+
+    // Check if we were aborted (or the user switched chats) during stream
+    // processing. Use the turn's captured controller/history (c.*), not the
+    // reassignable globals, so a mid-turn chat switch can't make this read the
+    // wrong abort state or return another chat.
+    if (isAborted(c.abortController) || isStaleTurn(c)) {
+        return { error: 'Aborted', history: c.chatHistory };
+    }
+
+    // STEP 5: Otherwise exit - handle remaining text content and final sync
+    // Only modify history here for final text content (top level only)
+    if (isTopLevel) {
+        // Non-blocking + coalesced: mid-turn checkpoints keep crash safety but
+        // no longer stack up serial full-history writes as the recursion unwinds.
+        // The rounds below made no more calls and the turn wasn't stopped, so
+        // the conversation is finished, and this checkpoint saves it as such.
+        // The end-of-turn save no longer holds the composer, and if the tab
+        // closed before it landed, an interrupted:true left by this one would
+        // offer Resume on a finished build.
+        c.interrupted = false;
+        scheduleSaveCurrentChat(c);
+    }
+    
+    // Return the updated history
+    return {
+        history: c.chatHistory,
+        messageContent: c.currentMessageContent
+    };
+}

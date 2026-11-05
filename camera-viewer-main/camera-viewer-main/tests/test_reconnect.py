@@ -1,0 +1,205 @@
+import os
+import tempfile
+import unittest
+from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+from PyQt6.QtCore import QPoint, QSettings
+from PyQt6.QtWidgets import QApplication
+
+from app import ACCOUNT_REJECTED_MESSAGE, MainWindow
+
+
+class FakePlayer:
+    def __init__(self) -> None:
+        self.stdin = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return 0 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float) -> int:
+        return 0
+
+
+class ReconnectTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_directory = tempfile.TemporaryDirectory(prefix="intraswitch_okam_")
+        settings = QSettings(str(Path(self.settings_directory.name) / "settings.ini"), QSettings.Format.IniFormat)
+        with patch("app.QSettings", return_value=settings), patch("app.QTimer.singleShot"):
+            self.window = MainWindow()
+
+    def tearDown(self) -> None:
+        self.window.quit_requested = True
+        self.window.close()
+        self.settings_directory.cleanup()
+
+    def test_transport_failure_schedules_retry_and_stop_cancels_it(self) -> None:
+        self.window.on_stream_error("camera closed the native P2P session")
+        self.window.on_stream_finished()
+        self.assertTrue(self.window.reconnect_timer.isActive())
+        self.window.stop_stream()
+        self.assertFalse(self.window.reconnect_timer.isActive())
+
+    def test_reconnect_discovers_cameras_before_a_selection_exists(self) -> None:
+        self.window.devices = [SimpleNamespace(name="Entrance", uid="entrance")]
+        discoveries: list[bool] = []
+        self.window.find_cameras = lambda: discoveries.append(True)
+        self.window.reconnect()
+        self.assertEqual(discoveries, [True])
+
+    def test_player_keeps_last_image_while_reconnecting(self) -> None:
+        player = FakePlayer()
+        self.window.player = player
+        self.window.on_stream_error("camera closed the native P2P session")
+        self.window.on_stream_finished()
+        self.assertIs(self.window.player, player)
+        self.assertFalse(player.terminated)
+        self.window.stop_stream()
+        self.assertIsNone(self.window.player)
+        self.assertTrue(player.terminated)
+
+    def test_live_button_returns_to_live_video(self) -> None:
+        stopped: list[bool] = []
+        reconnected: list[bool] = []
+        self.window.show()
+        self.window.replay = SimpleNamespace(stop=lambda: stopped.append(True))
+        self.window.reconnect = lambda: reconnected.append(True)
+        self.window.live_button.click()
+        self.assertEqual(stopped, [True])
+        self.assertEqual(reconnected, [True])
+        self.assertIsNone(self.window.replay)
+
+    def test_drag_pans_zoomed_video_instead_of_moving_camera(self) -> None:
+        moves: list[tuple[str, ...]] = []
+        commands: list[list[object]] = []
+        self.window.control_camera = moves.append
+        self.window._mpv_command = lambda command: commands.append(command) or True
+        self.window.stream_live = True
+        self.window.zoom_level = 2
+        self.window.video.resize(1000, 500)
+        self.window.pan_zoomed_video(100, 0)
+        self.window.move_by_drag(100, 0)
+        self.assertEqual(moves, [])
+        self.assertAlmostEqual(self.window.video_pan[0], 0.05)
+        self.window.pan_zoomed_video(10000, 0)
+        self.assertAlmostEqual(self.window.video_pan[0], 0.25)
+        self.assertEqual(commands[-2], ["set_property", "video-pan-x", 0.25])
+
+    def test_wheel_zoom_keeps_the_point_under_the_cursor(self) -> None:
+        self.window._mpv_command = lambda command: True
+        self.window.stream_live = True
+        self.window.video.resize(1000, 500)
+        self.window.change_zoom(2, 750, 250)
+        self.assertEqual(self.window.zoom_level, 2)
+        self.assertAlmostEqual(self.window.video_pan[0], -0.125)
+        self.window.change_zoom(-2, 750, 250)
+        self.assertEqual(self.window.video_pan, (0.0, 0.0))
+
+    def test_double_click_toggles_full_screen_without_toggling_controls(self) -> None:
+        toggles: list[bool] = []
+        fullscreen: list[bool] = []
+        self.window.toggle_fullscreen = lambda: fullscreen.append(True)
+        self.window.video.double_clicked.disconnect()
+        self.window.video.double_clicked.connect(lambda x, y: self.window.toggle_fullscreen())
+        self.window.video.clicked.connect(lambda: toggles.append(True))
+        for _ in range(2):
+            self.window.video._start_drag(750, 250, QPoint(750, 250))
+            self.window.video._finish_drag(750, 250, QPoint(750, 250))
+        self.assertEqual(fullscreen, [True])
+        self.assertFalse(self.window.video.click_timer.isActive())
+        self.assertEqual(toggles, [])
+
+    def test_zoom_notice_returns_to_the_current_status(self) -> None:
+        self.window._mpv_command = lambda command: True
+        self.window.stream_live = True
+        self.window.set_status("Live video")
+        self.window.change_zoom(1)
+        self.window.change_zoom(-1)
+        self.assertEqual(self.window.status_text, "Zoom 1.0×.")
+        self.assertTrue(self.window.notice_timer.isActive())
+        self.window.set_status("Live video")
+        self.assertEqual(self.window.status_text, "Zoom 1.0×.")
+        self.window.notice_timer.timeout.emit()
+        self.assertEqual(self.window.status_text, "Live video")
+
+    def test_rejected_camera_credentials_do_not_retry(self) -> None:
+        self.window.on_stream_error("The camera rejected the available credentials.")
+        self.window.on_stream_finished()
+        self.assertFalse(self.window.reconnect_timer.isActive())
+
+    def test_unreachable_account_service_schedules_retry(self) -> None:
+        self.window.show()
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        self.assertTrue(self.window.account_retry_timer.isActive())
+        self.assertIn("Reconnecting in 2s.", self.window.status_text)
+
+    def test_unreachable_account_service_is_retried_while_other_cameras_play(self) -> None:
+        camera = SimpleNamespace(name="Kitchen", uid="kitchen")
+        self.window.devices = [camera]
+        self.window.device_accounts = {camera.uid: "rtsp"}
+        self.window.sync_previews = lambda: None
+        self.window.watch_live = lambda: None
+        self.window.account_username = "owner"
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        self.assertFalse(self.window.retry_pending)
+        self.assertTrue(self.window.account_retry_timer.isActive())
+        self.assertEqual(self.window.account_error.text(), "O-KAM account lookup is unreachable.")
+        lookups: list[tuple[str, str]] = []
+        with patch("app.stored_account_password", return_value="secret"), \
+                patch.object(self.window, "start_account_lookup", side_effect=lambda *lookup: lookups.append(lookup)):
+            self.window.account_retry_timer.timeout.emit()
+        self.assertEqual(lookups, [("owner", "secret")])
+
+    def test_account_retry_skips_an_account_without_a_saved_password(self) -> None:
+        self.window.failed_accounts = ["owner"]
+        with patch("app.stored_account_password", return_value=None), \
+                patch.object(self.window, "start_account_lookup") as lookup:
+            self.window.retry_failed_accounts()
+        lookup.assert_not_called()
+        self.assertEqual(self.window.failed_accounts, [])
+
+    def test_found_account_cameras_clear_the_account_retry(self) -> None:
+        self.window.account_username = "owner"
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        with patch("app.save_account_password", return_value=True):
+            self.window.on_devices_found([SimpleNamespace(name="Garden", uid="garden")])
+        self.assertEqual(self.window.failed_accounts, [])
+        self.assertFalse(self.window.account_error.isVisibleTo(self.window))
+
+    def test_rejected_account_login_does_not_retry(self) -> None:
+        self.window.show()
+        self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
+        self.window.on_account_finished()
+        self.assertFalse(self.window.reconnect_timer.isActive())
+        self.assertFalse(self.window.account_retry_timer.isActive())
+
+    def test_rejected_account_login_does_not_reopen_a_hidden_window(self) -> None:
+        self.window.hide()
+        self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(self.window.account_error.text(), ACCOUNT_REJECTED_MESSAGE)
+
+    def test_drag_moves_camera_opposite_to_image_motion(self) -> None:
+        commands: list[tuple[str, ...]] = []
+        self.window.control_camera = commands.append
+        for dx, dy in ((90, 0), (-90, 0), (0, 90), (0, -90)):
+            self.window.move_by_drag(dx, dy)
+        self.assertEqual(commands, [("Left",), ("Right",), ("Up",), ("Down",)])
+
+
+if __name__ == "__main__":
+    unittest.main()
